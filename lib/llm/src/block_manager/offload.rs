@@ -72,6 +72,15 @@ use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 
 const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 4;
 const DEFAULT_MAX_TRANSFER_BATCH_SIZE: usize = 16;
+/// Maximum number of pending offload requests drained from the channel and
+/// processed together in a single iteration of [`OffloadManager::offload_worker`].
+///
+/// Setting this above 1 amortizes per-block control-channel round-trips
+/// (`match_sequence_hashes`, `allocate_blocks`, `register_blocks`) across many
+/// evicted blocks at once. At production GPU cache scale (~32K blocks), the
+/// per-block cost of these round-trips dominates wall-clock latency until
+/// blocks become matchable in the host pool — see issue #7566.
+const DEFAULT_OFFLOAD_DRAIN_BATCH_SIZE: usize = 64;
 
 pub fn max_concurrent_transfers() -> usize {
     read_usize_env(
@@ -84,6 +93,17 @@ pub fn max_transfer_batch_size() -> usize {
     read_usize_env(
         "DYN_KVBM_MAX_TRANSFER_BATCH_SIZE",
         DEFAULT_MAX_TRANSFER_BATCH_SIZE,
+    )
+}
+
+/// How many offload requests `offload_worker` drains and processes per loop
+/// iteration. Larger values reduce control-channel round-trip overhead at
+/// production cache scale; smaller values reduce latency to first registration
+/// when traffic is light. Must be > 0.
+pub fn offload_drain_batch_size() -> usize {
+    read_usize_env(
+        "DYN_KVBM_OFFLOAD_DRAIN_BATCH_SIZE",
+        DEFAULT_OFFLOAD_DRAIN_BATCH_SIZE,
     )
 }
 
@@ -408,14 +428,18 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         let source_pool = source_pool.as_ref().unwrap();
         let target_pool = target_pool.as_ref().unwrap();
 
+        // Priority queue of pending offload requests, ordered by `OffloadRequestKey`
+        // (lower priority value first; ties broken by tick / arrival order).
         let mut queue = BTreeSet::new();
+
+        let drain_batch_size = offload_drain_batch_size();
 
         loop {
             if cancellation_token.is_cancelled() {
                 return Ok(());
             }
 
-            // Try to check the offload queue.
+            // Try to drain the offload queue without blocking.
             loop {
                 match offload_rx.try_recv() {
                     Ok(request) => {
@@ -428,79 +452,178 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 }
             }
 
-            // If there is a request, process it.
-            if let Some(request) = queue.pop_first() {
-                // Try to upgrade the block to a strong reference.
-                let block = match request.block.upgrade() {
-                    Some(block) => Some(ImmutableBlock::new(block)),
-                    // If unable to upgrade, the block may have been moved to the inactive pool.
-                    None => source_pool
-                        .match_sequence_hashes(vec![request.sequence_hash].as_slice())
-                        .await?
-                        .pop(),
-                };
-
-                // If we've found the block, offload it.
-                if let Some(block) = block {
-                    // If the block is already in the target, don't offload it.
-                    if let Ok(blocks) = target_pool
-                        .match_sequence_hashes(vec![request.sequence_hash].as_slice())
-                        .await
-                        && !blocks.is_empty()
-                    {
-                        continue;
-                    }
-
-                    if let Some(offload_filter) = offload_filter.as_ref()
-                        && !offload_filter.should_offload(request.sequence_hash)
-                    {
-                        continue;
-                    }
-
-                    let target_block = 'target_block: {
-                        if let Ok(blocks) = target_pool.allocate_blocks(1).await
-                            && let Some(block) = blocks.into_iter().next()
-                        {
-                            break 'target_block Some(block);
-                        }
-
-                        tracing::warn!(
-                            "Target pool full. Skipping offload. This should only ever happen with very small pool sizes."
-                        );
-                        None
-                    };
-
-                    if let Some(target_block) = target_block {
-                        tracing::debug!(
-                            "Offloading block with sequence hash {} to target pool.",
-                            request.sequence_hash
-                        );
-
-                        // Track the offload metric if available
-                        if let Some(ref metric) = offload_metric {
-                            metric.inc();
-                        }
-
-                        transfer_manager
-                            .enqueue_transfer(PendingTransfer::new(
-                                vec![block],
-                                vec![target_block],
-                                None,
-                                target_pool.clone(),
-                            ))
-                            .await?;
-                    }
+            // Pop up to `drain_batch_size` highest-priority requests off the
+            // queue and process them as a single batch. Batching amortizes the
+            // per-block control-channel round-trips on `match_sequence_hashes`,
+            // `allocate_blocks`, and `register_blocks` across many evicted
+            // blocks; at production GPU cache scale, this is what allows the
+            // host pool to keep up with eviction bursts (issue #7566).
+            let mut batch_requests = Vec::with_capacity(drain_batch_size);
+            for _ in 0..drain_batch_size {
+                match queue.pop_first() {
+                    Some(req) => batch_requests.push(req),
+                    None => break,
                 }
-            } else {
-                // Await the next request.
+            }
+
+            if batch_requests.is_empty() {
+                // Nothing pending — block until the next request or cancellation.
                 tokio::select! {
                     _ = cancellation_token.cancelled() => return Ok(()),
                     Some(request) = offload_rx.recv() => {
                         queue.insert(request);
                     }
                 }
+                continue;
+            }
+
+            Self::offload_batch(
+                source_pool,
+                target_pool,
+                batch_requests,
+                transfer_manager.as_ref(),
+                offload_filter.as_ref(),
+                offload_metric.as_ref(),
+            )
+            .await?;
+        }
+    }
+
+    /// Process a batch of offload requests, sharing a single round-trip per
+    /// pool operation across all blocks in the batch. The set of blocks
+    /// actually offloaded is the intersection of:
+    ///   - blocks still resolvable in the source pool (some may have moved
+    ///     to the inactive pool between request submission and now),
+    ///   - blocks not already present in the target pool (deduplication),
+    ///   - blocks the offload filter does not reject.
+    ///
+    /// All surviving blocks are submitted as a single [`PendingTransfer`];
+    /// downstream the [`TransferBatcher`] splits this into chunks of
+    /// `max_transfer_batch_size` for the actual CUDA transfers and
+    /// `register_blocks` calls.
+    async fn offload_batch<Source: Storage, Target: Storage>(
+        source_pool: &Arc<dyn BlockPool<Source, Locality, Metadata>>,
+        target_pool: &Arc<dyn BlockPool<Target, Locality, Metadata>>,
+        batch_requests: Vec<OffloadRequest<Source, Locality, Metadata>>,
+        transfer_manager: &dyn TransferManager<Source, Target, Locality, Metadata>,
+        offload_filter: Option<&Arc<dyn OffloadFilter>>,
+        offload_metric: Option<&prometheus::IntCounter>,
+    ) -> Result<()> {
+        // 1. Apply the offload filter up front so we never spend pool round-
+        //    trips on blocks the filter would reject anyway.
+        let filtered_requests: Vec<_> = match offload_filter {
+            Some(filter) => batch_requests
+                .into_iter()
+                .filter(|req| filter.should_offload(req.sequence_hash))
+                .collect(),
+            None => batch_requests,
+        };
+        if filtered_requests.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Resolve each request to a strong source-block reference.
+        //    Strong refs (still in the active pool) are upgraded inline.
+        //    Weak refs that have decayed (block moved to the inactive pool)
+        //    are recovered via a single batched `match_sequence_hashes` call.
+        let mut blocks: Vec<ImmutableBlock<Source, Locality, Metadata>> =
+            Vec::with_capacity(filtered_requests.len());
+        let mut needs_lookup_hashes: Vec<_> = Vec::new();
+
+        for req in &filtered_requests {
+            if let Some(block) = req.block.upgrade() {
+                blocks.push(ImmutableBlock::new(block));
+            } else {
+                needs_lookup_hashes.push(req.sequence_hash);
             }
         }
+
+        if !needs_lookup_hashes.is_empty() {
+            let recovered = source_pool
+                .match_sequence_hashes(needs_lookup_hashes.as_slice())
+                .await?;
+            blocks.extend(recovered);
+        }
+
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Skip blocks already present in the target pool. One batched
+        //    `match_sequence_hashes` covers the entire batch.
+        let candidate_hashes: Vec<_> = blocks.iter().map(|b| b.sequence_hash()).collect();
+        let already_present: std::collections::HashSet<_> = target_pool
+            .match_sequence_hashes(candidate_hashes.as_slice())
+            .await
+            .map(|present| present.into_iter().map(|b| b.sequence_hash()).collect())
+            .unwrap_or_default();
+
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|b| !already_present.contains(&b.sequence_hash()))
+            .collect();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        // 4. Allocate target blocks for the survivors in a single call. If the
+        //    target pool can't satisfy the full request, fall back to the
+        //    largest prefix it can serve.
+        let need = blocks.len();
+        let target_blocks = match target_pool.allocate_blocks(need).await {
+            Ok(allocated) if !allocated.is_empty() => allocated,
+            Ok(_) => {
+                tracing::warn!(
+                    requested = need,
+                    "Target pool returned zero blocks for batch allocation; skipping batch."
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    requested = need,
+                    error = ?e,
+                    "Target pool allocation failed for batch; skipping batch."
+                );
+                return Ok(());
+            }
+        };
+
+        let actually_offloaded = target_blocks.len();
+        if actually_offloaded < need {
+            tracing::warn!(
+                requested = need,
+                allocated = actually_offloaded,
+                "Target pool could not satisfy full batch; offloading partial batch."
+            );
+        }
+
+        let sources: Vec<_> = blocks.into_iter().take(actually_offloaded).collect();
+
+        // 5. Account for every block that will actually be transferred.
+        if let Some(metric) = offload_metric {
+            metric.inc_by(actually_offloaded as u64);
+        }
+
+        tracing::debug!(
+            batch_size = actually_offloaded,
+            "Offloading batch to target pool."
+        );
+
+        // 6. Submit a single PendingTransfer covering the whole batch. The
+        //    TransferBatcher downstream splits this into chunks of
+        //    `max_transfer_batch_size` for the CUDA copies and the per-chunk
+        //    `register_blocks` call.
+        transfer_manager
+            .enqueue_transfer(PendingTransfer::new(
+                sources,
+                target_blocks,
+                None,
+                target_pool.clone(),
+            ))
+            .await?;
+
+        Ok(())
     }
 
     async fn onboard_worker<Source: Storage, Target: Storage>(
@@ -1175,6 +1298,95 @@ mod tests {
         );
 
         check_block_contents(&immutable_device_block, &host_blocks[0], 42)?;
+
+        Ok(())
+    }
+
+    /// Regression test for issue #7566: when a burst of evictions submits many
+    /// offload requests in rapid succession, the offload pipeline must batch
+    /// the work through the pool control channels rather than serializing one
+    /// round-trip per block. This test stresses the pipeline with more blocks
+    /// than `max_transfer_batch_size`, mirroring what happens at production
+    /// GPU cache size (~32K blocks on B200) when many evictions hit at once.
+    /// All blocks must become matchable in the host pool within a bounded
+    /// wait — the failure mode the issue describes is most blocks staying
+    /// unmatchable for tens of seconds.
+    #[tokio::test]
+    async fn test_offload_burst_all_become_matchable() -> Result<()> {
+        // Choose a count that exercises both the in-worker drain batch
+        // (`offload_drain_batch_size`, default 64) and the downstream
+        // `TransferBatcher` split point (`max_transfer_batch_size`, default 16).
+        let block_count = 2 * max_transfer_batch_size() + 5;
+
+        let (offload_manager, device_pool, host_pool, _) = build_pools(
+            block_count,
+            Some(block_count),
+            None,
+            None,
+        )?;
+
+        let device_pool = device_pool.as_ref().unwrap();
+        let host_pool = host_pool.as_ref().unwrap();
+
+        // Build, register, and populate `block_count` device blocks with
+        // unique token sequences so each gets a distinct sequence hash.
+        let mut raw_blocks = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let block = completed_block(device_pool, [i as u32, 0, 0, 0]).await?;
+            raw_blocks.push(block);
+        }
+        let immutable_device_blocks = device_pool.register_blocks(raw_blocks).await?;
+        for (i, block) in immutable_device_blocks.iter().enumerate() {
+            populate_block(block, (i + 1) as u8)?;
+        }
+
+        // Submit the entire burst to the offload manager back-to-back, the
+        // way the device pool's eviction code does. Priority 0 = highest.
+        for block in &immutable_device_blocks {
+            offload_manager.offload(block, 0).await?;
+        }
+
+        // Wait for the pipeline to drain. Allow generous slack so this is a
+        // correctness test, not a performance assertion. The pre-fix code
+        // would frequently fail to register all blocks even within seconds.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Every offloaded block must now be matchable in the host pool.
+        let all_hashes: Vec<_> = immutable_device_blocks
+            .iter()
+            .map(|b| b.sequence_hash())
+            .collect();
+        let host_matched = host_pool
+            .match_sequence_hashes(all_hashes.as_slice())
+            .await?;
+
+        assert_eq!(
+            host_matched.len(),
+            block_count,
+            "Expected all {} offloaded blocks to be matchable in the host pool, \
+             but only {} were registered. This is the failure mode of #7566 — \
+             the offload pipeline could not drain the eviction burst.",
+            block_count,
+            host_matched.len()
+        );
+
+        // Spot-check content integrity of the first and last blocks to make
+        // sure batching did not scramble source/target pairing.
+        let host_first = host_matched
+            .iter()
+            .find(|b| b.sequence_hash() == immutable_device_blocks[0].sequence_hash())
+            .expect("first block missing");
+        check_block_contents(&immutable_device_blocks[0], host_first, 1)?;
+
+        let host_last = host_matched
+            .iter()
+            .find(|b| b.sequence_hash() == immutable_device_blocks[block_count - 1].sequence_hash())
+            .expect("last block missing");
+        check_block_contents(
+            &immutable_device_blocks[block_count - 1],
+            host_last,
+            block_count as u8,
+        )?;
 
         Ok(())
     }

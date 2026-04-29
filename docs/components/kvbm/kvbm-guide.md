@@ -391,11 +391,16 @@ trtllm-serve Qwen/Qwen3-0.6B --host localhost --port 8000 --backend pytorch --ex
 
 **Symptom:** Enabling KVBM does not show TTFT improvement or causes performance degradation.
 
-**Cause:** Not enough prefix cache hits on KVBM to reuse offloaded KV blocks.
-
-**Solution:** Enable KVBM metrics and check the Grafana dashboard for `Onboard Blocks - Host to Device` and `Onboard Blocks - Disk to Device`. Large numbers of onboarded KV blocks indicate good cache reuse:
+**Diagnosis:** First, enable KVBM metrics and check the Grafana dashboard for `Onboard Blocks - Host to Device` and `Onboard Blocks - Disk to Device`. Large numbers of onboarded KV blocks indicate good cache reuse:
 
 ![Grafana Example](../../assets/img/kvbm-metrics-grafana.png)
+
+If `Offload Blocks - Device to Host` (`kvbm_offload_blocks_d2h`) increases but `Onboard Blocks - Host to Device` (`kvbm_onboard_blocks_h2d`) and `Matched Tokens` stay at zero, the offloaded blocks are reaching CPU memory but are not yet matchable in the leader's host pool. This usually means one of:
+
+1. **Insufficient prefix overlap.** The simplest case: incoming requests don't share prefixes with anything offloaded. Confirm by sending an identical prompt twice with several other prompts in between to force eviction; the second copy should hit `kvbm_onboard_blocks_h2d`.
+2. **Eviction burst exceeds the offload pipeline drain rate.** When the GPU KV cache is large (tens of thousands of blocks) and many blocks evict at once, the per-block overhead of registering them into the host pool can lag the eviction rate, leaving recently evicted blocks unmatchable for several seconds. Tune `DYN_KVBM_OFFLOAD_DRAIN_BATCH_SIZE` (default 64) upward to amortize control-channel round-trips, or `DYN_KVBM_MAX_CONCURRENT_TRANSFERS` to increase pipeline parallelism. As a last resort you can shrink the GPU KV cache via `--num-gpu-blocks-override` so eviction bursts are smaller.
+
+> **Note:** `--num-gpu-blocks-override` is a workaround, not a recommendation. Setting it well below the natural cache size sacrifices on-GPU prefix-cache capacity. Prefer the pipeline-tuning environment variables above.
 
 ### KVBM Worker Initialization Timeout
 
