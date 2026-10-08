@@ -327,6 +327,7 @@ For the full lifecycle, conditions, and monitoring command reference, see [DGDR 
 | **Profiling job won't schedule** | GPU nodes are tainted. Add tolerations through `overrides.profilingJob`. |
 | **Spec edits rejected** | The DGDR spec is immutable once it enters `Profiling`, except that a request with `autoApply: false` may set or change `runtimeVersionOverride` during `Profiling` or `Ready`. In `Ready`, it may also enable `autoApply`. Delete and recreate the DGDR for other changes. |
 | **Multinode deployment errors out** | Grove or LWS is missing. See [Multinode Orchestration](../installation/multinode-orchestration.md). |
+| **Profiling fails with "does not map to a supported gpuSku"** | The cluster's GPU product is not in the `gpuSku` list, so auto-detection cannot pick a SKU. Recreate the DGDR with `hardware.gpuSku`, `vramMb`, `numGpusPerNode`, and `totalGpus` set explicitly. |
 
 ### Profiling Job Fails to Schedule
 

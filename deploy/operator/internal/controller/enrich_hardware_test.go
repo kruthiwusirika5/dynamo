@@ -190,9 +190,10 @@ func TestEnrichHardwareFromDiscovery(t *testing.T) {
 			wantGPUSKU:    "v100_sxm", wantVRAM: 16384, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
 		},
 		{
-			name:          "nothing set, unknown GPU falls back to model name",
-			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "FutureGPU-X1000", VRAMPerGPU: 65536},
-			wantGPUSKU:    "FutureGPU-X1000", wantVRAM: 65536, wantGPUsNode: 4, wantTotalGPUs: 4, wantChanged: true,
+			// DCGM reports the product with spaces; see issue #13239.
+			name:          "nothing set, unknown GPU is rejected instead of persisting the raw model name",
+			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "NVIDIA RTX PRO 6000 Blackwell Server Edition", VRAMPerGPU: 98304},
+			wantErr:       `GPU product "NVIDIA RTX PRO 6000 Blackwell Server Edition", which does not map to a supported gpuSku`,
 		},
 		{
 			name: "only totalGpus missing, discovery fills it",
@@ -549,25 +550,25 @@ func TestEnrichHardwareFromDiscovery_NormalizesBareModelFromDCGM(t *testing.T) {
 	}
 }
 
-// TestEnrichHardwareFromDiscovery_FallsBackToModelForUnknownGPU verifies that for GPUs
-// not in the AIC support matrix, the raw GFD product name is used as a fallback.
-func TestEnrichHardwareFromDiscovery_FallsBackToModelForUnknownGPU(t *testing.T) {
-	r := newFakeReconciler(gpuNode("gpu-node-1", "Tesla-V100-SXM2-16GB", 8, 16384))
+// TestEnrichHardwareFromDiscovery_RejectsUnknownGPUProduct is the regression test for
+// issue #13239: node-label discovery of a GPU that InferHardwareSystem does not recognize
+// used to write the raw nvidia.com/gpu.product label value into spec.hardware.gpuSku. That
+// value is not in the CRD enum, so the DGDR update failed with an opaque "Unsupported
+// value" error. Discovery must instead leave gpuSku unset and name the product.
+func TestEnrichHardwareFromDiscovery_RejectsUnknownGPUProduct(t *testing.T) {
+	// GPU Feature Discovery publishes the product label with dashes instead of spaces.
+	const product = "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition"
+	r := newFakeReconciler(gpuNode("gpu-node-1", product, 4, 98304))
 
 	dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
-		Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{
-			Hardware: &nvidiacomv1beta1.HardwareSpec{
-				GPUSKU:         "Tesla-V100-SXM2-16GB",
-				VRAMMB:         ptr.To(float64(16384)),
-				NumGPUsPerNode: ptr.To(int32(8)),
-				TotalGPUs:      ptr.To(int32(8)),
-			},
-		},
+		Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{},
 	}
 
 	_, err := r.enrichHardwareFromDiscovery(context.Background(), dgdr)
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), product, "error must name the unrecognized product")
+	assert.Contains(t, err.Error(), "spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus}",
+		"error must tell the user which fields to set")
 	require.NotNil(t, dgdr.Spec.Hardware)
-	assert.Equal(t, "Tesla-V100-SXM2-16GB", string(dgdr.Spec.Hardware.GPUSKU),
-		"Unknown GPU should fall back to raw model name")
+	assert.Empty(t, string(dgdr.Spec.Hardware.GPUSKU), "raw product string must not be written to gpuSku")
 }

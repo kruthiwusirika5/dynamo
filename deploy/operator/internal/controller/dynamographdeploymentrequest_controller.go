@@ -1936,7 +1936,18 @@ func (r *DynamoGraphDeploymentRequestReconciler) enrichHardwareFromDiscovery(ctx
 		case inferred != "":
 			hw.GPUSKU = inferred
 		default:
-			hw.GPUSKU = nvidiacomv1beta1.GPUSKUType(gpuInfo.Model)
+			// Never persist the raw product string. It is not a member of the
+			// gpuSku CRD enum, so the DGDR update would be rejected by the API
+			// server with an opaque "Unsupported value" error. Leave gpuSku unset
+			// and fail with a message that names the product. The request lands
+			// in the terminal Failed phase, and discovery filtered by a SKU cannot
+			// select nodes of an unsupported product, so the user must recreate
+			// the request with every required hardware field set.
+			return changed, fmt.Errorf(
+				"auto-discovery found GPU product %q, which does not map to a supported gpuSku; "+
+					"recreate the DynamoGraphDeploymentRequest with "+
+					"spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus} set explicitly "+
+					"(discovery cannot select nodes of an unsupported product)", gpuInfo.Model)
 		}
 		changed = true
 	}
