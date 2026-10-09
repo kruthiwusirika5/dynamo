@@ -1,0 +1,149 @@
+From 7b1bc3c352cc41f70d0bf10f74afd8ccc7241569 Mon Sep 17 00:00:00 2001
+From: Sai Kruthi Wusirika <kruthiwusirika@gmail.com>
+Date: Thu, 8 Oct 2026 22:49:52 +0000
+Subject: [PATCH] fix(operator): reject unrecognized GPU products in DGDR
+ hardware discovery
+
+When InferHardwareSystem does not recognize the discovered GPU product
+(for example "NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+enrichHardwareFromDiscovery fell back to writing the raw
+nvidia.com/gpu.product string into spec.hardware.gpuSku. That value is
+not a member of the gpuSku CRD enum, so the DGDR update was rejected by
+the API server with an opaque "Unsupported value" error. The fallback
+could never succeed end to end: the profiler's own DGDR validation only
+accepts enum values too.
+
+Drop the raw-string fallback. Leave gpuSku unset and return an error
+that names the product and tells the user to recreate the request with
+spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus} set, since the
+request lands in the terminal Failed phase and discovery filtered by a
+SKU cannot select nodes of an unsupported product. The message surfaces
+on the Profiling condition and the ProfilingJobFailed warning event.
+
+Replace the test that asserted the raw fallback with one that drives
+node-label discovery with the GPU Feature Discovery form of the product
+from the issue, switch the DCGM-path table case to the DCGM form, and
+document the behavior in the DGDR reference and troubleshooting pages.
+
+Issue: #13239
+Signed-off-by: Sai Kruthi Wusirika <kruthiwusirika@gmail.com>
+---
+ ...dynamographdeploymentrequest_controller.go | 13 ++++++-
+ .../controller/enrich_hardware_test.go        | 37 ++++++++++---------
+ .../auto-deployment/auto-deploy-with-dgdr.md  |  1 +
+ .../dynamo-graph-deployment-request.mdx       |  5 +++
+ 4 files changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/deploy/operator/internal/controller/dynamographdeploymentrequest_controller.go b/deploy/operator/internal/controller/dynamographdeploymentrequest_controller.go
+index 61cc15549..776931ef6 100644
+--- a/deploy/operator/internal/controller/dynamographdeploymentrequest_controller.go
++++ b/deploy/operator/internal/controller/dynamographdeploymentrequest_controller.go
+@@ -1936,7 +1936,18 @@ func (r *DynamoGraphDeploymentRequestReconciler) enrichHardwareFromDiscovery(ctx
+ 		case inferred != "":
+ 			hw.GPUSKU = inferred
+ 		default:
+-			hw.GPUSKU = nvidiacomv1beta1.GPUSKUType(gpuInfo.Model)
++			// Never persist the raw product string. It is not a member of the
++			// gpuSku CRD enum, so the DGDR update would be rejected by the API
++			// server with an opaque "Unsupported value" error. Leave gpuSku unset
++			// and fail with a message that names the product. The request lands
++			// in the terminal Failed phase, and discovery filtered by a SKU cannot
++			// select nodes of an unsupported product, so the user must recreate
++			// the request with every required hardware field set.
++			return changed, fmt.Errorf(
++				"auto-discovery found GPU product %q, which does not map to a supported gpuSku; "+
++					"recreate the DynamoGraphDeploymentRequest with "+
++					"spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus} set explicitly "+
++					"(discovery cannot select nodes of an unsupported product)", gpuInfo.Model)
+ 		}
+ 		changed = true
+ 	}
+diff --git a/deploy/operator/internal/controller/enrich_hardware_test.go b/deploy/operator/internal/controller/enrich_hardware_test.go
+index bdf0fe19b..44be5e89f 100644
+--- a/deploy/operator/internal/controller/enrich_hardware_test.go
++++ b/deploy/operator/internal/controller/enrich_hardware_test.go
+@@ -190,9 +190,10 @@ func TestEnrichHardwareFromDiscovery(t *testing.T) {
+ 			wantGPUSKU:    "v100_sxm", wantVRAM: 16384, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
+ 		},
+ 		{
+-			name:          "nothing set, unknown GPU falls back to model name",
+-			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "FutureGPU-X1000", VRAMPerGPU: 65536},
+-			wantGPUSKU:    "FutureGPU-X1000", wantVRAM: 65536, wantGPUsNode: 4, wantTotalGPUs: 4, wantChanged: true,
++			// DCGM reports the product with spaces; see issue #13239.
++			name:          "nothing set, unknown GPU is rejected instead of persisting the raw model name",
++			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "NVIDIA RTX PRO 6000 Blackwell Server Edition", VRAMPerGPU: 98304},
++			wantErr:       `GPU product "NVIDIA RTX PRO 6000 Blackwell Server Edition", which does not map to a supported gpuSku`,
+ 		},
+ 		{
+ 			name: "only totalGpus missing, discovery fills it",
+@@ -549,25 +550,25 @@ func TestEnrichHardwareFromDiscovery_NormalizesBareModelFromDCGM(t *testing.T) {
+ 	}
+ }
+ 
+-// TestEnrichHardwareFromDiscovery_FallsBackToModelForUnknownGPU verifies that for GPUs
+-// not in the AIC support matrix, the raw GFD product name is used as a fallback.
+-func TestEnrichHardwareFromDiscovery_FallsBackToModelForUnknownGPU(t *testing.T) {
+-	r := newFakeReconciler(gpuNode("gpu-node-1", "Tesla-V100-SXM2-16GB", 8, 16384))
++// TestEnrichHardwareFromDiscovery_RejectsUnknownGPUProduct is the regression test for
++// issue #13239: node-label discovery of a GPU that InferHardwareSystem does not recognize
++// used to write the raw nvidia.com/gpu.product label value into spec.hardware.gpuSku. That
++// value is not in the CRD enum, so the DGDR update failed with an opaque "Unsupported
++// value" error. Discovery must instead leave gpuSku unset and name the product.
++func TestEnrichHardwareFromDiscovery_RejectsUnknownGPUProduct(t *testing.T) {
++	// GPU Feature Discovery publishes the product label with dashes instead of spaces.
++	const product = "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition"
++	r := newFakeReconciler(gpuNode("gpu-node-1", product, 4, 98304))
+ 
+ 	dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
+-		Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{
+-			Hardware: &nvidiacomv1beta1.HardwareSpec{
+-				GPUSKU:         "Tesla-V100-SXM2-16GB",
+-				VRAMMB:         ptr.To(float64(16384)),
+-				NumGPUsPerNode: ptr.To(int32(8)),
+-				TotalGPUs:      ptr.To(int32(8)),
+-			},
+-		},
++		Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{},
+ 	}
+ 
+ 	_, err := r.enrichHardwareFromDiscovery(context.Background(), dgdr)
+-	require.NoError(t, err)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), product, "error must name the unrecognized product")
++	assert.Contains(t, err.Error(), "spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus}",
++		"error must tell the user which fields to set")
+ 	require.NotNil(t, dgdr.Spec.Hardware)
+-	assert.Equal(t, "Tesla-V100-SXM2-16GB", string(dgdr.Spec.Hardware.GPUSKU),
+-		"Unknown GPU should fall back to raw model name")
++	assert.Empty(t, string(dgdr.Spec.Hardware.GPUSKU), "raw product string must not be written to gpuSku")
+ }
+diff --git a/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md b/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md
+index a0ba8883b..b10c6495e 100644
+--- a/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md
++++ b/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md
+@@ -327,6 +327,7 @@ For the full lifecycle, conditions, and monitoring command reference, see [DGDR
+ | **Profiling job won't schedule** | GPU nodes are tainted. Add tolerations through `overrides.profilingJob`. |
+ | **Spec edits rejected** | The DGDR spec is immutable once it enters `Profiling`, except that a request with `autoApply: false` may set or change `runtimeVersionOverride` during `Profiling` or `Ready`. In `Ready`, it may also enable `autoApply`. Delete and recreate the DGDR for other changes. |
+ | **Multinode deployment errors out** | Grove or LWS is missing. See [Multinode Orchestration](../installation/multinode-orchestration.md). |
++| **Profiling fails with "does not map to a supported gpuSku"** | The cluster's GPU product is not in the `gpuSku` list, so auto-detection cannot pick a SKU. Recreate the DGDR with `hardware.gpuSku`, `vramMb`, `numGpusPerNode`, and `totalGpus` set explicitly. |
+ 
+ ### Profiling Job Fails to Schedule
+ 
+diff --git a/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx b/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
+index 0f0f297ec..c3fffe9fa 100644
+--- a/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
++++ b/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
+@@ -763,6 +763,11 @@ spec:
+     gpuSku: gb200
+ ```
+ 
++If the discovered product name does not map to any allowed value (for example `NVIDIA RTX PRO 6000
++Blackwell Server Edition`), the operator does not write the raw name into `gpuSku`. Discovery fails,
++the request enters `Failed`, and the `Profiling` condition names the product. Recreate the request
++with `hardware.gpuSku`, `vramMb`, `numGpusPerNode`, and `totalGpus` set explicitly.
++
+ <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>vr_nvl72</Badge> <Badge intent="note" minimal>gb200</Badge> <Badge intent="note" minimal>gb200_sxm</Badge> <Badge intent="note" minimal>gb10</Badge> <Badge intent="note" minimal>b300_sxm</Badge> <Badge intent="note" minimal>b200_sxm</Badge> <Badge intent="note" minimal>h200_sxm</Badge> <Badge intent="note" minimal>h100_sxm</Badge> <Badge intent="note" minimal>h100_pcie</Badge> <Badge intent="note" minimal>a100_sxm</Badge> <Badge intent="note" minimal>a100_pcie</Badge> <Badge intent="note" minimal>a30</Badge> <Badge intent="note" minimal>l40s</Badge> <Badge intent="note" minimal>l40</Badge> <Badge intent="note" minimal>l4</Badge> <Badge intent="note" minimal>v100_sxm</Badge> <Badge intent="note" minimal>v100_pcie</Badge> <Badge intent="note" minimal>t4</Badge> <Badge intent="note" minimal>mi200</Badge> <Badge intent="note" minimal>mi300</Badge></span>
+ 
+ <Warning>
+-- 
+2.43.0
