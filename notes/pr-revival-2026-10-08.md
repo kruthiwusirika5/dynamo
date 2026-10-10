@@ -120,108 +120,153 @@ Closed by #13486 (ayaangazali, merged Sep 10 by julienmancuso). `ValidateTermina
 only the metadata rules on terminating DGDs, with handler tests for the replace, remove,
 unsupported-value, and finalizer-only cases. Nothing to pick up.
 
-## 3. #13239 — fix implemented, pushed, ready to open
+## 3. #13239 — revised on Oct 10: review #13575, open the enum-sync PR instead
 
-Issue is open, assigned to hhzhang16 and sttts, no linked PR. Stefan Schimanski's recent commits
-(#15216 B300, #15711 GB200, #15703 VR200) add SKU constants, enum entries, CRD regeneration, and
-docs, but none touches the raw-string fallback; `git log -S` on that line shows nothing after the
-June squash import. Because the issue is assigned, post this on #13239 first:
+The issue thread, read through the GitHub API on Oct 10, changed the plan:
 
-> I have a small PR ready for the fallback part of this: drop the raw `nvidia.com/gpu.product`
-> write in `enrichHardwareFromDiscovery`, leave `gpuSku` unset, and fail with an error that
-> names the product and says to recreate the request with the hardware fields set. Regression
-> test uses the RTX PRO 6000 product string on both the DCGM and node-label paths, plus a line
-> in the DGDR reference and troubleshooting docs. It does not touch the enum/AIC divergence,
-> which I think deserves its own issue. Happy to defer if either of you is already on it;
-> otherwise I will open it today.
+- **An open PR already covers the fallback fix: #13575** (saiyambharara, opened Aug 19,
+  "fix(operator): stop writing unrecognized gpu models into gpusku"). Same shape as our fix
+  branch, plus a `SupportedGPUSKUs()` helper and more tests. julienmancuso reviewed on Aug 20
+  (make the remediation match the discovery contract) and yankay on Sep 1 (say the DGDR must be
+  recreated); both threads are resolved. Lightweight CI was green on Sep 1. The author pinged on
+  Aug 29 and Sep 15, naming hhzhang16, sttts, jh-nv, and tmonty12 (CODEOWNERS for
+  `discovery.go`), with no reply since. Five bot threads remain, all minor (duplicate standalone
+  test, missing `t.Log` headings, assert the full error contract, mixed-cluster follow-up).
+- **#13575 no longer merges.** `git merge-tree` against main `a83f4796b` conflicts in
+  `deploy/operator/internal/gpu/discovery.go` because of the SKU additions in #15216, #15711,
+  and #15703. It also has no docs change, which `deploy/operator/AGENTS.md` asks for.
+- **Do not open our fix branch as a PR.** It stays on the fork as a fallback:
+  https://github.com/kruthiwusirika5/dynamo/tree/fix/dgdr-gpusku-unknown-product-13239
+- **The part of #13239 nobody has a PR for is the enum sync.** The reporter's follow-up says
+  AIConfigurator ships `rtx_pro_6000_server`; vvagias reproduced the same failure for
+  `NVIDIA-GB300`. AIC has shipped both systems since v0.8.0 (May 2026), well before the AIC
+  version Dynamo adopted in July (#11986). The third missing AIC name, `b60`, is an Intel-class
+  entry (SYCL and oneCCL in its system file) and is out of scope for `nvidia.com/gpu.product`
+  discovery.
 
-Branch, pushed from your kruthiwusirika5 fork by a sibling session (this session could not push):
+### The enum-sync PR (implemented, pushed, ready to open)
 
-- https://github.com/kruthiwusirika5/dynamo/tree/fix/dgdr-gpusku-unknown-product-13239
-- based on upstream `22698fe0`; one commit, authored and DCO-signed as
-  `Sai Kruthi Wusirika <kruthiwusirika@gmail.com>`. Sign it with your key before opening the PR
-  (`git commit --amend -S --no-edit`); upstream wants Verified commits on fork PRs for automatic
-  `/ok to test`.
-- patch file next to this note: `0001-fix-operator-reject-unrecognized-GPU-products-in-DGD.patch`.
+Branch https://github.com/kruthiwusirika5/dynamo/tree/fix/dgdr-gpusku-rtx-pro-6000-gb300-13239
+(HEAD `8f3d1a958`, one commit on upstream main `b208989fb`), authored and DCO-signed as you,
+modeled on sttts's B300 commit (#15216):
 
-What the commit does (after the adversarial pass; two things changed from the first draft):
-
-- `enrichHardwareFromDiscovery`: no raw fallback. The error names the product and says to
-  recreate the DGDR with `spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus}` set. The
-  longer advice is deliberate: the request lands in the terminal `Failed` phase (pre-existing,
-  documented behavior, editing the spec in place does nothing), and discovery filtered by a SKU
-  cannot select nodes of an unsupported product, so setting only `gpuSku` fails again.
-- The `GetGPUDiscoveryFailureReason` case from the first draft is gone. Its only production
-  caller classifies the DCGM error before node-label fallback, so the case was dead code and
-  the commit message claim about logging was false.
-- Tests: the DCGM table case now uses the DCGM form of the product (with spaces); the node-label
-  regression test uses the GPU Feature Discovery form (`NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition`).
-  The `KeepsUserProvidedGPUSKU` test from the first draft was removed because it never reached
-  the `gpuSku` block (same flaw as the upstream test it replaced).
-- Docs: one paragraph in the reference page's SKU format section (the curated page
-  `deploy/operator/AGENTS.md` says to update in the same PR) and one Troubleshoot row.
-- The message surfaces on the `Profiling` condition (reason `JobCreationFailed`), the
-  `Succeeded` condition, and a `ProfilingJobFailed` warning event.
-
-Disclose in the PR: the removed fallback was intentional upstream ("for GPUs not in the AIC
-support matrix, the raw GFD product name is used as a fallback") but could never succeed end to
-end, because the profiler's own Python validation also accepts only enum values. The fix changes
-the error, not the outcome.
+- `GPUSKUType`: add `gb300` and `rtx_pro_6000_server` (both enum markers, constants, CRD,
+  Python types, generated API references).
+- `InferHardwareSystem`: `NVIDIA GB300` and `NVIDIA-GB300` infer `gb300` (rule placed before
+  B300, whose guard already refuses GB300). `NVIDIA RTX PRO 6000 Blackwell Server Edition` and
+  the GPU Feature Discovery form infer `rtx_pro_6000_server`; the rule is a bounded token plus a
+  required `SERVER` marker, so the Workstation and Max-Q editions stay unrecognized instead of
+  silently profiling against the server card. Done as a generic `requires` field on `gpuRule`
+  rather than another one-off guard.
+- Tests: eight inference cases (both products, both label forms, two negative editions,
+  `RTX PRO 60000`), two enrichment table rows, two admission cases.
+- Docs: SKU-format paragraph on the curated DGDR reference page; the two generated references
+  were regenerated with `make generate-api-docs`.
 
 Validation on upstream main with Go 1.26.8:
 
 ```
-go build ./...                                                        ok
-go vet ./internal/controller/                                         ok
-gofmt -s -l <changed files>                                           clean
-golangci-lint v1.62.2 (the version CI's Dockerfile installs)          0 issues on ./internal/controller/...
-golangci-lint v1.64.8 (Makefile pin)                                  0 issues
-go test ./internal/controller/ -run 'TestEnrichHardwareFromDiscovery' PASS
+go build ./... && go vet (gpu, controller, webhook/validation, api)   ok
+gofmt -s -l                                                           clean
+golangci-lint v1.62.2 on gpu, api, webhook/validation, controller     0 issues
 go test ./internal/gpu/                                               ok
-go test ./internal/controller/ (full package incl. 75-spec envtest)   ok (83s)
+go test ./internal/controller/ -run TestEnrichHardwareFromDiscovery   ok
+go test ./internal/webhook/validation/ -run TestDynamoGraphDeploymentRequestValidator (envtest)   ok
+make check (regenerates everything, fails on drift)                   clean
 ```
 
-PR description (fills the repo template):
+Patch file next to this note: `0001-fix-operator-support-RTX-PRO-6000-Server-and-GB300-i.patch`.
+
+Commands to sign, push, and open it (adjust the first line):
+
+```bash
+cd ~/dynamo
+git fetch origin fix/dgdr-gpusku-rtx-pro-6000-gb300-13239
+git checkout -B fix/dgdr-gpusku-rtx-pro-6000-gb300-13239 origin/fix/dgdr-gpusku-rtx-pro-6000-gb300-13239
+git commit --amend -S --no-edit
+git push --force-with-lease origin fix/dgdr-gpusku-rtx-pro-6000-gb300-13239
+gh pr create --repo ai-dynamo/dynamo --base main \
+  --head kruthiwusirika5:fix/dgdr-gpusku-rtx-pro-6000-gb300-13239 \
+  --title "fix(operator): support RTX PRO 6000 Server and GB300 in DGDR GPU discovery" \
+  --body-file /tmp/pr-body.md
+```
+
+PR description (`/tmp/pr-body.md`):
 
 ```
-fix(operator): reject unrecognized GPU products in DGDR hardware discovery
-
 ## Overview:
 
-DGDR hardware auto-discovery wrote the raw `nvidia.com/gpu.product` string into
-`spec.hardware.gpuSku` when `InferHardwareSystem` did not recognize the GPU. That value is
-not in the `gpuSku` CRD enum, so the DGDR update was rejected with an opaque
-`Unsupported value` error and discovery failed without saying why. The fallback could never
-succeed end to end: the profiler's own DGDR validation accepts only enum values too, so this
-change replaces an opaque failure with an actionable one.
+AIConfigurator has shipped `rtx_pro_6000_server` and `gb300` system definitions since v0.8.0,
+but the DGDR `gpuSku` enum does not accept either name and `InferHardwareSystem` has no rule
+for the products, so clusters with these GPUs cannot use hardware auto-discovery at all
+(#13239 reports the RTX PRO 6000 Blackwell Server Edition; GB300 is reproduced in the same
+thread). This is the enum-sync half of #13239. The raw-string fallback itself is handled by
+#13575; the two changes are independent.
 
 ## Details:
 
-- `enrichHardwareFromDiscovery`: remove the raw-string fallback. When neither discovery nor
-  `InferHardwareSystem` yields a SKU, leave `gpuSku` unset and return an error that names the
-  product and tells the user to recreate the request with
-  `spec.hardware.{gpuSku,vramMb,numGpusPerNode,totalGpus}` set. The request enters the
-  terminal `Failed` phase as before; discovery filtered by a SKU cannot select nodes of an
-  unsupported product, so all four fields are needed.
-- Tests: the DCGM-path table case uses the DCGM form of the RTX PRO 6000 product; the old
-  `FallsBackToModelForUnknownGPU` test (which set `gpuSku` by hand and never exercised the
-  fallback) is replaced by `RejectsUnknownGPUProduct`, which drives node-label discovery with
-  the GPU Feature Discovery form and checks that `gpuSku` stays empty.
-- Docs: a paragraph in the DGDR reference SKU format section and a Troubleshoot row.
+- `GPUSKUType`: add `gb300` and `rtx_pro_6000_server` (enum markers, constants, regenerated
+  CRD, Python DGDR types, and API references).
+- `InferHardwareSystem`: `NVIDIA GB300` / `NVIDIA-GB300` infer `gb300`; the rule sits before
+  B300, whose guard already refuses GB300. `NVIDIA RTX PRO 6000 Blackwell Server Edition` and
+  its GPU Feature Discovery label form infer `rtx_pro_6000_server`. The RTX rule is a bounded
+  token plus a required `SERVER` marker, so the Workstation and Max-Q editions, which have no
+  profiler data, stay unrecognized rather than silently profiling against the server card.
+  Implemented as a generic `requires` field on `gpuRule`.
+- Tests: inference cases for both products and both label forms, two negative editions and
+  `RTX PRO 60000`; enrichment table rows; admission cases.
+- Docs: SKU-format paragraph on the curated DGDR reference page; generated references updated
+  with `make generate-api-docs`. `make check` is clean.
 
-Out of scope: reconciling the CRD enum with AIConfigurator's systems list. I will open a
-separate issue for that so this one can close.
+Out of scope: `b60` (an Intel-class AIC entry, not an `nvidia.com/gpu.product` value) and the
+seven enum values that have no AIC system.
 
 ## Where should the reviewer start?
 
-`deploy/operator/internal/controller/dynamographdeploymentrequest_controller.go`, the
-`if hw.GPUSKU == ""` block in `enrichHardwareFromDiscovery`, then
-`enrich_hardware_test.go` `TestEnrichHardwareFromDiscovery_RejectsUnknownGPUProduct`.
+`deploy/operator/internal/gpu/discovery.go` (`gpuRules` and the `requires` field), then
+`TestInferHardwareSystem` in `discovery_test.go`.
 
 ## Related Issues
 
-- Closes #13239
+- Relates to #13239
 ```
+
+### Comments to post, in this order, after the PR exists (replace NNNN)
+
+On **#13575** (a PR comment, as a fellow contributor):
+
+> I hit the same bug independently and had a near-identical patch ready, so rather than open a
+> competing PR I'd like to help get this one in. Three things from checking it against today's
+> main:
+>
+> 1. It no longer merges: `discovery.go` conflicts with the SKU additions from #15216, #15711
+>    and #15703. The rebase should be mechanical, since `SupportedGPUSKUs()` sits after
+>    `InferHardwareSystem`.
+> 2. `deploy/operator/AGENTS.md` asks for the curated `dynamo-graph-deployment-request.mdx` page
+>    to be updated in the same PR when controller behavior changes, and the SKU-format section
+>    currently describes only the happy path. I have a paragraph for it plus a Troubleshoot row
+>    for `auto-deploy-with-dgdr.md` on
+>    https://github.com/kruthiwusirika5/dynamo/commit/df3260954 if you want to cherry-pick them.
+> 3. For the "closest supported value" problem yankay and vvagias raised: #NNNN adds
+>    `rtx_pro_6000_server` and `gb300` to the enum and to `InferHardwareSystem`, so the two
+>    products reported in #13239 stop reaching this error path. The PRs are independent.
+>
+> On the bot nits, folding the standalone unknown-GPU test into the table as a node-label row
+> would close two of them. Otherwise this looks ready once rebased.
+
+On **#13239** (an issue comment):
+
+> Two updates after reading the thread: #13575 already covers the fallback write, so I'm
+> reviewing that one rather than duplicating it. For the enum-sync gap @Kennyezzz found,
+> AIConfigurator has shipped `rtx_pro_6000_server` and `gb300` since v0.8.0, so #NNNN adds
+> both to the CRD enum and to `InferHardwareSystem` for the DCGM and GPU Feature Discovery
+> product forms, Server edition only for the RTX card (the Workstation and Max-Q editions have
+> no profiler data). `b60` is an Intel-class entry in AIC and out of scope for
+> `nvidia.com/gpu.product` discovery. @vvagias that covers the `NVIDIA-GB300` label you
+> reproduced.
+
+If I post either comment from a session, it carries a "Generated by Claude Code" footer. Posting
+them yourself avoids that.
 
 ## 4. DEP comments
 
@@ -320,5 +365,5 @@ Held back (corrected versions):
 This session was bound to `kruthiwusirika45/dynamo`, where the Claude GitHub App is not
 installed, so every push returned 403. You reconnected GitHub as kruthiwusirika5 (app installed,
 all repositories), but a session cannot attach a second repository with the same name. A sibling
-session started on `kruthiwusirika5/dynamo` applied the patch and pushed the branch above. For
+session started on `kruthiwusirika5/dynamo` applied the patches and pushed the branches above. For
 future work on Dynamo, start sessions with `kruthiwusirika5/dynamo` selected as the source.

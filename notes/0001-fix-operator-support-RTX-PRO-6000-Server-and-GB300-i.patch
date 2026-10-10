@@ -1,0 +1,385 @@
+From 8f3d1a958cdcc25a066cc841a350bb47e15ee77c Mon Sep 17 00:00:00 2001
+From: Sai Kruthi Wusirika <kruthiwusirika@gmail.com>
+Date: Sat, 10 Oct 2026 20:20:02 +0000
+Subject: [PATCH] fix(operator): support RTX PRO 6000 Server and GB300 in DGDR
+ GPU discovery
+
+AIConfigurator has shipped system definitions for rtx_pro_6000_server
+and gb300 since v0.8.0, but the DGDR gpuSku enum did not accept either
+name and InferHardwareSystem had no rule for the products, so clusters
+with these GPUs could not use hardware auto-discovery at all. Issue
+#13239 reports this for the RTX PRO 6000 Blackwell Server Edition and a
+follow-up comment reproduces it for GB300.
+
+Add both values to the GPUSKUType enum and map the product names the
+GPU Feature Discovery labels and DCGM report: "NVIDIA GB300" and
+"NVIDIA-GB300" infer gb300, and "NVIDIA RTX PRO 6000 Blackwell Server
+Edition" and its label form infer rtx_pro_6000_server. The RTX rule
+requires the Server marker because the Workstation and Max-Q editions
+have no profiler data; they stay unrecognized rather than silently
+profiling against the server card's numbers. GB300 is placed ahead of
+the B300 rule, which already refuses to match it.
+
+Regenerate the CRD, the Python DGDR types, and the API reference docs;
+add inference, enrichment, and admission test cases; and document the
+new product mappings in the DGDR reference page.
+
+Relates to #13239
+
+Signed-off-by: Sai Kruthi Wusirika <kruthiwusirika@gmail.com>
+---
+ .../profiler/utils/dgdr_v1beta1_types.py      |  2 +
+ .../dynamographdeploymentrequest_types.go     |  8 +++-
+ ...dia.com_dynamographdeploymentrequests.yaml |  4 ++
+ .../controller/enrich_hardware_test.go        | 10 +++++
+ deploy/operator/internal/gpu/discovery.go     | 17 ++++++++-
+ .../operator/internal/gpu/discovery_test.go   | 37 ++++++++++++++++++-
+ ...ploymentrequest_validation_envtest_test.go | 12 ++++++
+ .../additional-resources/api-reference-k8s.md |  8 ++--
+ .../dynamo-graph-deployment-request.mdx       |  8 +++-
+ .../kubernetes-api/full-api-reference.mdx     |  8 ++--
+ 10 files changed, 102 insertions(+), 12 deletions(-)
+
+diff --git a/components/src/dynamo/profiler/utils/dgdr_v1beta1_types.py b/components/src/dynamo/profiler/utils/dgdr_v1beta1_types.py
+index 66f8fca2f..eaa383b04 100644
+--- a/components/src/dynamo/profiler/utils/dgdr_v1beta1_types.py
++++ b/components/src/dynamo/profiler/utils/dgdr_v1beta1_types.py
+@@ -59,11 +59,13 @@ class SearchStrategy(str, Enum):
+ 
+ class GPUSKUType(str, Enum):
+     VRNVL72 = "vr_nvl72"
++    GB300 = "gb300"
+     GB200 = "gb200"
+     GB200SXM = "gb200_sxm"
+     GB10 = "gb10"
+     B300SXM = "b300_sxm"
+     B200SXM = "b200_sxm"
++    RTXPro6000Server = "rtx_pro_6000_server"
+     H200SXM = "h200_sxm"
+     H100SXM = "h100_sxm"
+     H100PCIe = "h100_pcie"
+diff --git a/deploy/operator/api/v1beta1/dynamographdeploymentrequest_types.go b/deploy/operator/api/v1beta1/dynamographdeploymentrequest_types.go
+index ed5365160..981473648 100644
+--- a/deploy/operator/api/v1beta1/dynamographdeploymentrequest_types.go
++++ b/deploy/operator/api/v1beta1/dynamographdeploymentrequest_types.go
+@@ -174,13 +174,14 @@ const (
+ )
+ 
+ // GPUSKUType identifies a supported GPU for discovery and profiling.
+-// +kubebuilder:validation:Enum=vr_nvl72;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
++// +kubebuilder:validation:Enum=vr_nvl72;gb300;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;rtx_pro_6000_server;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
+ type GPUSKUType string
+ 
+ const (
+ 	// --- Vera Rubin ---
+ 	GPUSKUTypeVRNVL72 GPUSKUType = "vr_nvl72"
+ 	// --- Blackwell ---
++	GPUSKUTypeGB300 GPUSKUType = "gb300"
+ 	GPUSKUTypeGB200 GPUSKUType = "gb200"
+ 
+ 	// Deprecated: use GPUSKUTypeGB200. GB200 systems use NVL rather than SXM.
+@@ -188,6 +189,9 @@ const (
+ 	GPUSKUTypeGB10     GPUSKUType = "gb10"
+ 	GPUSKUTypeB300SXM  GPUSKUType = "b300_sxm"
+ 	GPUSKUTypeB200SXM  GPUSKUType = "b200_sxm"
++	// RTX PRO 6000 Blackwell Server Edition. Workstation and Max-Q editions are not
++	// covered by this identifier and are not inferred from discovery.
++	GPUSKUTypeRTXPro6000Server GPUSKUType = "rtx_pro_6000_server"
+ 	// --- Hopper ---
+ 	GPUSKUTypeH200SXM  GPUSKUType = "h200_sxm"
+ 	GPUSKUTypeH100SXM  GPUSKUType = "h100_sxm"
+@@ -412,7 +416,7 @@ type HardwareSpec struct {
+ 	// restricted to nodes matching this SKU.
+ 	// The legacy value gb200_sxm is deprecated; use gb200 instead.
+ 	// +optional
+-	// +kubebuilder:validation:Enum=vr_nvl72;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
++	// +kubebuilder:validation:Enum=vr_nvl72;gb300;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;rtx_pro_6000_server;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
+ 	GPUSKU GPUSKUType `json:"gpuSku,omitempty"`
+ 
+ 	// VRAMMB is the VRAM per GPU in MiB.
+diff --git a/deploy/operator/config/crd/bases/nvidia.com_dynamographdeploymentrequests.yaml b/deploy/operator/config/crd/bases/nvidia.com_dynamographdeploymentrequests.yaml
+index 30ad11d05..cc272ea58 100644
+--- a/deploy/operator/config/crd/bases/nvidia.com_dynamographdeploymentrequests.yaml
++++ b/deploy/operator/config/crd/bases/nvidia.com_dynamographdeploymentrequests.yaml
+@@ -604,11 +604,13 @@ spec:
+                       allOf:
+                         - enum:
+                             - vr_nvl72
++                            - gb300
+                             - gb200
+                             - gb200_sxm
+                             - gb10
+                             - b300_sxm
+                             - b200_sxm
++                            - rtx_pro_6000_server
+                             - h200_sxm
+                             - h100_sxm
+                             - h100_pcie
+@@ -625,11 +627,13 @@ spec:
+                             - mi300
+                         - enum:
+                             - vr_nvl72
++                            - gb300
+                             - gb200
+                             - gb200_sxm
+                             - gb10
+                             - b300_sxm
+                             - b200_sxm
++                            - rtx_pro_6000_server
+                             - h200_sxm
+                             - h100_sxm
+                             - h100_pcie
+diff --git a/deploy/operator/internal/controller/enrich_hardware_test.go b/deploy/operator/internal/controller/enrich_hardware_test.go
+index bdf0fe19b..c8610e55a 100644
+--- a/deploy/operator/internal/controller/enrich_hardware_test.go
++++ b/deploy/operator/internal/controller/enrich_hardware_test.go
+@@ -189,6 +189,16 @@ func TestEnrichHardwareFromDiscovery(t *testing.T) {
+ 			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 8, Model: "Tesla-V100-SXM2-16GB", VRAMPerGPU: 16384},
+ 			wantGPUSKU:    "v100_sxm", wantVRAM: 16384, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
+ 		},
++		{
++			name:          "nothing set, RTX PRO 6000 Blackwell Server Edition discovered (issue #13239)",
++			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 8, Model: "NVIDIA RTX PRO 6000 Blackwell Server Edition", VRAMPerGPU: 97887},
++			wantGPUSKU:    "rtx_pro_6000_server", wantVRAM: 97887, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
++		},
++		{
++			name:          "nothing set, GB300 discovered",
++			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "NVIDIA GB300", VRAMPerGPU: 284208},
++			wantGPUSKU:    "gb300", wantVRAM: 284208, wantGPUsNode: 4, wantTotalGPUs: 4, wantChanged: true,
++		},
+ 		{
+ 			name:          "nothing set, unknown GPU falls back to model name",
+ 			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "FutureGPU-X1000", VRAMPerGPU: 65536},
+diff --git a/deploy/operator/internal/gpu/discovery.go b/deploy/operator/internal/gpu/discovery.go
+index 686ce3178..8cfd68f41 100644
+--- a/deploy/operator/internal/gpu/discovery.go
++++ b/deploy/operator/internal/gpu/discovery.go
+@@ -87,6 +87,7 @@ const (
+ // --- GPU model tokens ---
+ const (
+ 	tokenVRNVL72 = "VRNVL72"
++	tokenGB300   = "GB300"
+ 	tokenGB200   = "GB200"
+ 	tokenGB10    = "GB10"
+ 	tokenB300    = "B300"
+@@ -106,6 +107,14 @@ const (
+ 	LabelNVLink  = "nvlink"
+ )
+ 
++// RTX PRO 6000 Blackwell ships in Server, Workstation, and Max-Q editions.
++// Only the Server Edition has an AIConfigurator system, so its rule also
++// requires the "SERVER" marker to avoid silently profiling the wrong card.
++const (
++	tokenRTXPro6000 = "RTXPRO6000"
++	markerServer    = "SERVER"
++)
++
+ // awsInstanceTypePrefixes matches known GPU/accelerator instance families on EKS. See: https://aws.amazon.com/ec2/instance-types/
+ var awsInstanceTypePrefixes = []string{
+ 	"p3.", "p3dn.", "p4d.", "p4de.", "p5.", // GPU instances
+@@ -123,7 +132,8 @@ var gcpMachineSeries = []string{
+ 
+ type gpuRule struct {
+ 	token        string
+-	boundedToken bool // require a complete model token instead of a substring match
++	boundedToken bool   // require a complete model token instead of a substring match
++	requires     string // additional normalized substring the product must contain
+ 	sxmSKU       nvidiacomv1beta1.GPUSKUType
+ 	pcieSKU      nvidiacomv1beta1.GPUSKUType
+ 	singleSKU    nvidiacomv1beta1.GPUSKUType // for GPUs without form factor variants
+@@ -134,10 +144,12 @@ var gpuRules = []gpuRule{
+ 	{token: tokenVRNVL72, boundedToken: true, singleSKU: nvidiacomv1beta1.GPUSKUTypeVRNVL72},
+ 
+ 	// Blackwell
++	{token: tokenGB300, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB300},
+ 	{token: tokenGB200, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB200},
+ 	{token: tokenGB10, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB10},
+ 	{token: tokenB300, sxmSKU: nvidiacomv1beta1.GPUSKUTypeB300SXM},
+ 	{token: tokenB200, sxmSKU: nvidiacomv1beta1.GPUSKUTypeB200SXM},
++	{token: tokenRTXPro6000, boundedToken: true, requires: markerServer, singleSKU: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server},
+ 
+ 	// Hopper
+ 	{token: tokenH200, sxmSKU: nvidiacomv1beta1.GPUSKUTypeH200SXM},
+@@ -964,6 +976,9 @@ func InferHardwareSystem(gpuProduct string) nvidiacomv1beta1.GPUSKUType {
+ 		if rule.boundedToken && !containsModelToken(gpuProduct, rule.token) {
+ 			continue
+ 		}
++		if rule.requires != "" && !strings.Contains(normalized, rule.requires) {
++			continue
++		}
+ 
+ 		// B300 must not match GB300, but compact product names can attach its SXM suffix.
+ 		if rule.token == tokenB300 && !containsB300ModelToken(gpuProduct) {
+diff --git a/deploy/operator/internal/gpu/discovery_test.go b/deploy/operator/internal/gpu/discovery_test.go
+index 2733e20bc..f06acca58 100644
+--- a/deploy/operator/internal/gpu/discovery_test.go
++++ b/deploy/operator/internal/gpu/discovery_test.go
+@@ -558,8 +558,43 @@ func TestInferHardwareSystem(t *testing.T) {
+ 			expected: nvidiacomv1beta1.GPUSKUTypeB300SXM,
+ 		},
+ 		{
+-			name:     "GB300 should not match B300",
++			name:     "GB300 maps to gb300, not b300_sxm",
+ 			input:    "NVIDIA GB300",
++			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
++		},
++		{
++			name:     "GB300 GPU Feature Discovery label form",
++			input:    "NVIDIA-GB300",
++			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
++		},
++		{
++			name:     "GB300 NVL72 product name",
++			input:    "NVIDIA GB300 NVL72",
++			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
++		},
++		{
++			name:     "RTX PRO 6000 Blackwell Server Edition as reported by DCGM",
++			input:    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
++			expected: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server,
++		},
++		{
++			name:     "RTX PRO 6000 Blackwell Server Edition GPU Feature Discovery label form",
++			input:    "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition",
++			expected: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server,
++		},
++		{
++			name:     "RTX PRO 6000 Blackwell Workstation Edition has no profiler system",
++			input:    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
++			expected: "",
++		},
++		{
++			name:     "RTX PRO 6000 Blackwell Max-Q Workstation Edition has no profiler system",
++			input:    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
++			expected: "",
++		},
++		{
++			name:     "RTX PRO 60000 should not match RTX PRO 6000",
++			input:    "NVIDIA RTX PRO 60000 Server Edition",
+ 			expected: "",
+ 		},
+ 		{
+diff --git a/deploy/operator/internal/webhook/validation/dynamographdeploymentrequest_validation_envtest_test.go b/deploy/operator/internal/webhook/validation/dynamographdeploymentrequest_validation_envtest_test.go
+index c5ee923a6..c1522d1bd 100644
+--- a/deploy/operator/internal/webhook/validation/dynamographdeploymentrequest_validation_envtest_test.go
++++ b/deploy/operator/internal/webhook/validation/dynamographdeploymentrequest_validation_envtest_test.go
+@@ -167,6 +167,18 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
+ 				request.Spec.Hardware = &nvidiacomv1beta1.HardwareSpec{GPUSKU: nvidiacomv1beta1.GPUSKUTypeB300SXM}
+ 			}),
+ 		},
++		{
++			name: "GB300 hardware is admitted",
++			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
++				request.Spec.Hardware = &nvidiacomv1beta1.HardwareSpec{GPUSKU: nvidiacomv1beta1.GPUSKUTypeGB300}
++			}),
++		},
++		{
++			name: "RTX PRO 6000 Server hardware is admitted",
++			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
++				request.Spec.Hardware = &nvidiacomv1beta1.HardwareSpec{GPUSKU: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server}
++			}),
++		},
+ 		{
+ 			name: "Vera Rubin NVL72 hardware is admitted",
+ 			request: betaDGDRForAdmission(func(request *nvidiacomv1beta1.DynamoGraphDeploymentRequest) {
+diff --git a/docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md b/docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md
+index 7c00261c9..0884134bd 100644
+--- a/docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md
++++ b/docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md
+@@ -2366,7 +2366,7 @@ _Underlying type:_ _string_
+ GPUSKUType identifies a supported GPU for discovery and profiling.
+ 
+ _Validation:_
+-- Enum: [vr_nvl72 gb200 gb200_sxm gb10 b300_sxm b200_sxm h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]
++- Enum: [vr_nvl72 gb300 gb200 gb200_sxm gb10 b300_sxm b200_sxm rtx_pro_6000_server h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]
+ 
+ _Appears in:_
+ - [HardwareSpec](#hardwarespec)
+@@ -2374,11 +2374,13 @@ _Appears in:_
+ | Field | Description |
+ | --- | --- |
+ | `vr_nvl72` | --- Vera Rubin ---<br /> |
+-| `gb200` | --- Blackwell ---<br /> |
++| `gb300` | --- Blackwell ---<br /> |
++| `gb200` |  |
+ | `gb200_sxm` | Deprecated: use GPUSKUTypeGB200. GB200 systems use NVL rather than SXM.<br /> |
+ | `gb10` |  |
+ | `b300_sxm` |  |
+ | `b200_sxm` |  |
++| `rtx_pro_6000_server` | RTX PRO 6000 Blackwell Server Edition. Workstation and Max-Q editions are not<br />covered by this identifier and are not inferred from discovery.<br /> |
+ | `h200_sxm` | --- Hopper ---<br /> |
+ | `h100_sxm` |  |
+ | `h100_pcie` |  |
+@@ -2429,7 +2431,7 @@ _Appears in:_
+ 
+ | Field | Description | Default | Validation |
+ | --- | --- | --- | --- |
+-| `gpuSku` _[GPUSKUType](#gpuskutype)_ | GPUSKU selects the GPU type to target.<br />When omitted, auto-detected by selecting the GPU with the highest<br />node count, then highest VRAM. In mixed-GPU clusters, set this to<br />choose which GPU type to use. Discovery and totalGpus are then<br />restricted to nodes matching this SKU.<br />The legacy value gb200_sxm is deprecated; use gb200 instead. |  | Enum: [vr_nvl72 gb200 gb200_sxm gb10 b300_sxm b200_sxm h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300] <br />Optional: \{\} <br /> |
++| `gpuSku` _[GPUSKUType](#gpuskutype)_ | GPUSKU selects the GPU type to target.<br />When omitted, auto-detected by selecting the GPU with the highest<br />node count, then highest VRAM. In mixed-GPU clusters, set this to<br />choose which GPU type to use. Discovery and totalGpus are then<br />restricted to nodes matching this SKU.<br />The legacy value gb200_sxm is deprecated; use gb200 instead. |  | Enum: [vr_nvl72 gb300 gb200 gb200_sxm gb10 b300_sxm b200_sxm rtx_pro_6000_server h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300] <br />Optional: \{\} <br /> |
+ | `vramMb` _float_ | VRAMMB is the VRAM per GPU in MiB.<br />When omitted, auto-detected from cluster GPU nodes. |  | Optional: \{\} <br /> |
+ | `totalGpus` _integer_ | TotalGPUs is the GPU budget for profiling and deployment.<br />The profiler uses this to determine parallelism and replica count.<br />When omitted, computed by counting GPUs on discovered nodes<br />(filtered by gpuSku when set), temporarily capped at 32 to<br />limit profiler search space. This cap may be removed in a future<br />release. Set this field explicitly to override. |  | Optional: \{\} <br /> |
+ | `numGpusPerNode` _integer_ | NumGPUsPerNode is the number of GPUs per node.<br />When omitted, auto-detected from cluster GPU nodes. |  | Optional: \{\} <br /> |
+diff --git a/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx b/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
+index 0f0f297ec..4bc200a66 100644
+--- a/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
++++ b/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx
+@@ -755,7 +755,11 @@ topologies, see the [Router Guide](../../developer-guide/knowledge-base/modular-
+ `gpuSku` is omitted, the operator normalizes the discovered GPU product name (for example,
+ `NVIDIA B300 SXM6 AC`) to the matching value (`b300_sxm`). The observed Vera Rubin product name
+ `NVIDIA VR NVL72 ES` and its GPU Feature Discovery form `NVIDIA-VR-NVL72-ES` map to the canonical
+-AISimulate identifier `vr_nvl72`. GB200 discovery uses the canonical AISimulate identifier `gb200`:
++AISimulate identifier `vr_nvl72`. GB300 product names (`NVIDIA GB300`, `NVIDIA-GB300`) map to
++`gb300`, and the RTX PRO 6000 Blackwell Server Edition (`NVIDIA RTX PRO 6000 Blackwell Server
++Edition`, `NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition`) maps to `rtx_pro_6000_server`; the
++Workstation and Max-Q editions have no profiler data and are not inferred. GB200 discovery uses the
++canonical AISimulate identifier `gb200`:
+ 
+ ```yaml
+ spec:
+@@ -763,7 +767,7 @@ spec:
+     gpuSku: gb200
+ ```
+ 
+-<span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>vr_nvl72</Badge> <Badge intent="note" minimal>gb200</Badge> <Badge intent="note" minimal>gb200_sxm</Badge> <Badge intent="note" minimal>gb10</Badge> <Badge intent="note" minimal>b300_sxm</Badge> <Badge intent="note" minimal>b200_sxm</Badge> <Badge intent="note" minimal>h200_sxm</Badge> <Badge intent="note" minimal>h100_sxm</Badge> <Badge intent="note" minimal>h100_pcie</Badge> <Badge intent="note" minimal>a100_sxm</Badge> <Badge intent="note" minimal>a100_pcie</Badge> <Badge intent="note" minimal>a30</Badge> <Badge intent="note" minimal>l40s</Badge> <Badge intent="note" minimal>l40</Badge> <Badge intent="note" minimal>l4</Badge> <Badge intent="note" minimal>v100_sxm</Badge> <Badge intent="note" minimal>v100_pcie</Badge> <Badge intent="note" minimal>t4</Badge> <Badge intent="note" minimal>mi200</Badge> <Badge intent="note" minimal>mi300</Badge></span>
++<span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>vr_nvl72</Badge> <Badge intent="note" minimal>gb300</Badge> <Badge intent="note" minimal>gb200</Badge> <Badge intent="note" minimal>gb200_sxm</Badge> <Badge intent="note" minimal>gb10</Badge> <Badge intent="note" minimal>b300_sxm</Badge> <Badge intent="note" minimal>b200_sxm</Badge> <Badge intent="note" minimal>rtx_pro_6000_server</Badge> <Badge intent="note" minimal>h200_sxm</Badge> <Badge intent="note" minimal>h100_sxm</Badge> <Badge intent="note" minimal>h100_pcie</Badge> <Badge intent="note" minimal>a100_sxm</Badge> <Badge intent="note" minimal>a100_pcie</Badge> <Badge intent="note" minimal>a30</Badge> <Badge intent="note" minimal>l40s</Badge> <Badge intent="note" minimal>l40</Badge> <Badge intent="note" minimal>l4</Badge> <Badge intent="note" minimal>v100_sxm</Badge> <Badge intent="note" minimal>v100_pcie</Badge> <Badge intent="note" minimal>t4</Badge> <Badge intent="note" minimal>mi200</Badge> <Badge intent="note" minimal>mi300</Badge></span>
+ 
+ <Warning>
+   `gb200_sxm` is deprecated because GB200 systems use NVL rather than SXM. Existing manifests remain
+diff --git a/docs/fern/pages/reference/kubernetes-api/full-api-reference.mdx b/docs/fern/pages/reference/kubernetes-api/full-api-reference.mdx
+index 70d4c3b63..62d870ab5 100644
+--- a/docs/fern/pages/reference/kubernetes-api/full-api-reference.mdx
++++ b/docs/fern/pages/reference/kubernetes-api/full-api-reference.mdx
+@@ -3497,17 +3497,19 @@ GPUSKUType identifies a supported GPU for discovery and profiling.
+ 
+ **Kind:** `enum`
+ **Underlying type:** `string`
+-**Validation:** Enum: [vr_nvl72 gb200 gb200_sxm gb10 b300_sxm b200_sxm h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]
++**Validation:** Enum: [vr_nvl72 gb300 gb200 gb200_sxm gb10 b300_sxm b200_sxm rtx_pro_6000_server h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]
+ **Appears in:** [HardwareSpec](#hardwarespec)
+ 
+ **Allowed values**
+ 
+ - <Badge intent="note" minimal>vr_nvl72</Badge> --- Vera Rubin ---
+-- <Badge intent="note" minimal>gb200</Badge> --- Blackwell ---
++- <Badge intent="note" minimal>gb300</Badge> --- Blackwell ---
++- <Badge intent="note" minimal>gb200</Badge>
+ - <Badge intent="note" minimal>gb200_sxm</Badge> Deprecated: use GPUSKUTypeGB200. GB200 systems use NVL rather than SXM.
+ - <Badge intent="note" minimal>gb10</Badge>
+ - <Badge intent="note" minimal>b300_sxm</Badge>
+ - <Badge intent="note" minimal>b200_sxm</Badge>
++- <Badge intent="note" minimal>rtx_pro_6000_server</Badge> RTX PRO 6000 Blackwell Server Edition. Workstation and Max-Q editions are not covered by this identifier and are not inferred from discovery.
+ - <Badge intent="note" minimal>h200_sxm</Badge> --- Hopper ---
+ - <Badge intent="note" minimal>h100_sxm</Badge>
+ - <Badge intent="note" minimal>h100_pcie</Badge>
+@@ -3552,7 +3554,7 @@ If all four fields are set, discovery is skipped.
+ <ParamField path="gpuSku" type="GPUSKUType">
+ GPUSKU selects the GPU type to target. When omitted, auto-detected by selecting the GPU with the highest node count, then highest VRAM. In mixed-GPU clusters, set this to choose which GPU type to use. Discovery and totalGpus are then restricted to nodes matching this SKU. The legacy value gb200_sxm is deprecated; use gb200 instead.
+ See [GPUSKUType](#gpuskutype).
+-**Validation:** Enum: [vr_nvl72 gb200 gb200_sxm gb10 b300_sxm b200_sxm h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]  Optional: \&#123;\&#125;
++**Validation:** Enum: [vr_nvl72 gb300 gb200 gb200_sxm gb10 b300_sxm b200_sxm rtx_pro_6000_server h200_sxm h100_sxm h100_pcie a100_sxm a100_pcie a30 l40s l40 l4 v100_sxm v100_pcie t4 mi200 mi300]  Optional: \&#123;\&#125;
+ </ParamField>
+ 
+ <ParamField path="vramMb" type="float">
+-- 
+2.43.0
+
