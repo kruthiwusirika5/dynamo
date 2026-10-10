@@ -174,13 +174,14 @@ const (
 )
 
 // GPUSKUType identifies a supported GPU for discovery and profiling.
-// +kubebuilder:validation:Enum=vr_nvl72;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
+// +kubebuilder:validation:Enum=vr_nvl72;gb300;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;rtx_pro_6000_server;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
 type GPUSKUType string
 
 const (
 	// --- Vera Rubin ---
 	GPUSKUTypeVRNVL72 GPUSKUType = "vr_nvl72"
 	// --- Blackwell ---
+	GPUSKUTypeGB300 GPUSKUType = "gb300"
 	GPUSKUTypeGB200 GPUSKUType = "gb200"
 
 	// Deprecated: use GPUSKUTypeGB200. GB200 systems use NVL rather than SXM.
@@ -188,6 +189,9 @@ const (
 	GPUSKUTypeGB10     GPUSKUType = "gb10"
 	GPUSKUTypeB300SXM  GPUSKUType = "b300_sxm"
 	GPUSKUTypeB200SXM  GPUSKUType = "b200_sxm"
+	// RTX PRO 6000 Blackwell Server Edition. Workstation and Max-Q editions are not
+	// covered by this identifier and are not inferred from discovery.
+	GPUSKUTypeRTXPro6000Server GPUSKUType = "rtx_pro_6000_server"
 	// --- Hopper ---
 	GPUSKUTypeH200SXM  GPUSKUType = "h200_sxm"
 	GPUSKUTypeH100SXM  GPUSKUType = "h100_sxm"
@@ -412,7 +416,7 @@ type HardwareSpec struct {
 	// restricted to nodes matching this SKU.
 	// The legacy value gb200_sxm is deprecated; use gb200 instead.
 	// +optional
-	// +kubebuilder:validation:Enum=vr_nvl72;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
+	// +kubebuilder:validation:Enum=vr_nvl72;gb300;gb200;gb200_sxm;gb10;b300_sxm;b200_sxm;rtx_pro_6000_server;h200_sxm;h100_sxm;h100_pcie;a100_sxm;a100_pcie;a30;l40s;l40;l4;v100_sxm;v100_pcie;t4;mi200;mi300
 	GPUSKU GPUSKUType `json:"gpuSku,omitempty"`
 
 	// VRAMMB is the VRAM per GPU in MiB.

@@ -59,11 +59,13 @@ class SearchStrategy(str, Enum):
 
 class GPUSKUType(str, Enum):
     VRNVL72 = "vr_nvl72"
+    GB300 = "gb300"
     GB200 = "gb200"
     GB200SXM = "gb200_sxm"
     GB10 = "gb10"
     B300SXM = "b300_sxm"
     B200SXM = "b200_sxm"
+    RTXPro6000Server = "rtx_pro_6000_server"
     H200SXM = "h200_sxm"
     H100SXM = "h100_sxm"
     H100PCIe = "h100_pcie"

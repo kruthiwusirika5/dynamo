@@ -190,6 +190,16 @@ func TestEnrichHardwareFromDiscovery(t *testing.T) {
 			wantGPUSKU:    "v100_sxm", wantVRAM: 16384, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
 		},
 		{
+			name:          "nothing set, RTX PRO 6000 Blackwell Server Edition discovered (issue #13239)",
+			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 8, Model: "NVIDIA RTX PRO 6000 Blackwell Server Edition", VRAMPerGPU: 97887},
+			wantGPUSKU:    "rtx_pro_6000_server", wantVRAM: 97887, wantGPUsNode: 8, wantTotalGPUs: 8, wantChanged: true,
+		},
+		{
+			name:          "nothing set, GB300 discovered",
+			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "NVIDIA GB300", VRAMPerGPU: 284208},
+			wantGPUSKU:    "gb300", wantVRAM: 284208, wantGPUsNode: 4, wantTotalGPUs: 4, wantChanged: true,
+		},
+		{
 			name:          "nothing set, unknown GPU falls back to model name",
 			discoveredGPU: &gpupkg.GPUInfo{NodeName: "n1", GPUsPerNode: 4, Model: "FutureGPU-X1000", VRAMPerGPU: 65536},
 			wantGPUSKU:    "FutureGPU-X1000", wantVRAM: 65536, wantGPUsNode: 4, wantTotalGPUs: 4, wantChanged: true,

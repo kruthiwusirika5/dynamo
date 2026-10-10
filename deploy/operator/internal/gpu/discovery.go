@@ -87,6 +87,7 @@ const (
 // --- GPU model tokens ---
 const (
 	tokenVRNVL72 = "VRNVL72"
+	tokenGB300   = "GB300"
 	tokenGB200   = "GB200"
 	tokenGB10    = "GB10"
 	tokenB300    = "B300"
@@ -106,6 +107,14 @@ const (
 	LabelNVLink  = "nvlink"
 )
 
+// RTX PRO 6000 Blackwell ships in Server, Workstation, and Max-Q editions.
+// Only the Server Edition has an AIConfigurator system, so its rule also
+// requires the "SERVER" marker to avoid silently profiling the wrong card.
+const (
+	tokenRTXPro6000 = "RTXPRO6000"
+	markerServer    = "SERVER"
+)
+
 // awsInstanceTypePrefixes matches known GPU/accelerator instance families on EKS. See: https://aws.amazon.com/ec2/instance-types/
 var awsInstanceTypePrefixes = []string{
 	"p3.", "p3dn.", "p4d.", "p4de.", "p5.", // GPU instances
@@ -123,7 +132,8 @@ var gcpMachineSeries = []string{
 
 type gpuRule struct {
 	token        string
-	boundedToken bool // require a complete model token instead of a substring match
+	boundedToken bool   // require a complete model token instead of a substring match
+	requires     string // additional normalized substring the product must contain
 	sxmSKU       nvidiacomv1beta1.GPUSKUType
 	pcieSKU      nvidiacomv1beta1.GPUSKUType
 	singleSKU    nvidiacomv1beta1.GPUSKUType // for GPUs without form factor variants
@@ -134,10 +144,12 @@ var gpuRules = []gpuRule{
 	{token: tokenVRNVL72, boundedToken: true, singleSKU: nvidiacomv1beta1.GPUSKUTypeVRNVL72},
 
 	// Blackwell
+	{token: tokenGB300, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB300},
 	{token: tokenGB200, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB200},
 	{token: tokenGB10, singleSKU: nvidiacomv1beta1.GPUSKUTypeGB10},
 	{token: tokenB300, sxmSKU: nvidiacomv1beta1.GPUSKUTypeB300SXM},
 	{token: tokenB200, sxmSKU: nvidiacomv1beta1.GPUSKUTypeB200SXM},
+	{token: tokenRTXPro6000, boundedToken: true, requires: markerServer, singleSKU: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server},
 
 	// Hopper
 	{token: tokenH200, sxmSKU: nvidiacomv1beta1.GPUSKUTypeH200SXM},
@@ -962,6 +974,9 @@ func InferHardwareSystem(gpuProduct string) nvidiacomv1beta1.GPUSKUType {
 
 	for _, rule := range gpuRules {
 		if rule.boundedToken && !containsModelToken(gpuProduct, rule.token) {
+			continue
+		}
+		if rule.requires != "" && !strings.Contains(normalized, rule.requires) {
 			continue
 		}
 

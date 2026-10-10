@@ -558,8 +558,43 @@ func TestInferHardwareSystem(t *testing.T) {
 			expected: nvidiacomv1beta1.GPUSKUTypeB300SXM,
 		},
 		{
-			name:     "GB300 should not match B300",
+			name:     "GB300 maps to gb300, not b300_sxm",
 			input:    "NVIDIA GB300",
+			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
+		},
+		{
+			name:     "GB300 GPU Feature Discovery label form",
+			input:    "NVIDIA-GB300",
+			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
+		},
+		{
+			name:     "GB300 NVL72 product name",
+			input:    "NVIDIA GB300 NVL72",
+			expected: nvidiacomv1beta1.GPUSKUTypeGB300,
+		},
+		{
+			name:     "RTX PRO 6000 Blackwell Server Edition as reported by DCGM",
+			input:    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+			expected: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server,
+		},
+		{
+			name:     "RTX PRO 6000 Blackwell Server Edition GPU Feature Discovery label form",
+			input:    "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition",
+			expected: nvidiacomv1beta1.GPUSKUTypeRTXPro6000Server,
+		},
+		{
+			name:     "RTX PRO 6000 Blackwell Workstation Edition has no profiler system",
+			input:    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+			expected: "",
+		},
+		{
+			name:     "RTX PRO 6000 Blackwell Max-Q Workstation Edition has no profiler system",
+			input:    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+			expected: "",
+		},
+		{
+			name:     "RTX PRO 60000 should not match RTX PRO 6000",
+			input:    "NVIDIA RTX PRO 60000 Server Edition",
 			expected: "",
 		},
 		{
